@@ -664,12 +664,12 @@ async function ensureModel(){
   };
 
   const attempts = [
-    // 1️⃣  Primary: onnx-community q8 (~20 MB) — proper v3 naming
-    { repo:"onnx-community/distilgpt2", opts:{ dtype:"q8"  }, label:"Downloading model q8 (~20 MB)…"  },
-    // 2️⃣  Fallback A: onnx-community q4 (~12 MB)
-    { repo:"onnx-community/distilgpt2", opts:{ dtype:"q4"  }, label:"Trying q4 fallback (~12 MB)…"    },
-    // 3️⃣  Fallback B: Xenova fp32 (~350 MB) — always public, works from any origin
-    { repo:"Xenova/distilgpt2",         opts:{ dtype:"fp32"}, label:"Trying Xenova fp32 (~350 MB)…"   },
+    // 1️⃣ Primary: Xenova/distilgpt2 quantized (~80 MB)
+    { repo:"Xenova/distilgpt2",         opts:{ quantized: true }, label:"Downloading Xenova/distilgpt2 (quantized)…" },
+    // 2️⃣ Universal fallback: Xenova fp32 (always public on HuggingFace Hub)
+    { repo:"Xenova/distilgpt2",         opts:{ dtype:"fp32" },    label:"Loading Xenova/distilgpt2 (fp32)…"           },
+    // 3️⃣ Alternative: onnx-community q8 (~20 MB)
+    { repo:"onnx-community/distilgpt2", opts:{ dtype:"q8" },      label:"Trying onnx-community/distilgpt2 (q8)…"      },
   ];
 
   let lastErr = null;
@@ -748,10 +748,48 @@ async function runInference(sentence){
   const allIds = [50256, ...tokenIds];
   const seqLen = allIds.length;
 
-  // 3. Build int64 tensor and run a single forward pass
+  // 3. Build int64 tensors with input_ids, attention_mask, and position_ids
+  // Many models (like Xenova/distilgpt2) require attention_mask and position_ids
   const inputIds = new Tensor("int64",
     BigInt64Array.from(allIds.map(BigInt)), [1, seqLen]);
-  const output = await model({ input_ids: inputIds });
+  const attentionMask = new Tensor("int64",
+    BigInt64Array.from(allIds.map(() => 1n)), [1, seqLen]);
+  const positionIds = new Tensor("int64",
+    BigInt64Array.from(allIds.map((_, i) => BigInt(i))), [1, seqLen]);
+
+  // Check what input names the model's ONNX session specifies
+  const session = model.model || model.session;
+  const inputNames = session?.inputNames || model.input_names;
+
+  let modelInputs = {
+    input_ids: inputIds,
+    attention_mask: attentionMask,
+    position_ids: positionIds
+  };
+
+  // If inputNames is defined on the session, filter to match the graph
+  if (Array.isArray(inputNames) && inputNames.length > 0) {
+    modelInputs = {};
+    for (const name of inputNames) {
+      if (name === "input_ids") modelInputs.input_ids = inputIds;
+      else if (name === "attention_mask") modelInputs.attention_mask = attentionMask;
+      else if (name === "position_ids") modelInputs.position_ids = positionIds;
+      else if (name === "use_cache_branch") modelInputs.use_cache_branch = new Tensor("bool", [false], [1]);
+    }
+    if (!modelInputs.input_ids) modelInputs.input_ids = inputIds;
+  }
+
+  let output;
+  try {
+    output = await model(modelInputs);
+  } catch (runErr) {
+    console.warn("Primary model invocation error, retrying with all standard inputs:", runErr.message);
+    output = await model({
+      input_ids: inputIds,
+      attention_mask: attentionMask,
+      position_ids: positionIds
+    });
+  }
 
   const vocabSize  = output.logits.dims[2];
   const logitsData = output.logits.data; // shape [1, seqLen, vocabSize] flattened
